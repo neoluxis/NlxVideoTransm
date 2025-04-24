@@ -1,0 +1,16 @@
+[Unit]
+Description=Video Stream Server From Video 0
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/vstream --device /dev/video0
+WorkingDirectory=/usr/local/bin
+Restart=always
+RestartSec=5
+User=root
+Group=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
