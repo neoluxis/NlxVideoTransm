@@ -1,37 +1,14 @@
-# Makefile for audio_stream.cpp
-
-# Compiler
 CXX = g++
+CXXFLAGS = -std=c++11 -Wall
+LDFLAGS = -lasound -pthread
 
-# Compiler flags
-CXXFLAGS = -std=c++11
+all: server
 
-# Linker flags
-LDFLAGS = -lportaudio
+server: server.o
+	$(CXX) -o server server.o $(LDFLAGS)
 
-# Target executable
-TARGET = server
+server.o: server.cpp
+	$(CXX) $(CXXFLAGS) -c server.cpp -o server.o
 
-# Source file
-SOURCES = server.cpp
-
-# Object file
-OBJECTS = $(SOURCES:.cpp=.o)
-
-# Default target
-all: $(TARGET)
-
-# Link object files to create executable
-$(TARGET): $(OBJECTS)
-	$(CXX) $(OBJECTS) -o $(TARGET) $(LDFLAGS)
-
-# Compile source files to object files
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-# Clean up build artifacts
 clean:
-	rm -f $(OBJECTS) $(TARGET)
-
-# Phony targets
-.PHONY: all clean
+	rm -f server server.o

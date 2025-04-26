@@ -10,10 +10,10 @@ CXXFLAGS = -std=c++11 `pkg-config --cflags opencv4`
 LDFLAGS = `pkg-config --libs opencv4`
 
 # Target executable
-TARGET = main
+TARGET = server
 
 # Source file
-SOURCES = main.cpp
+SOURCES = server.cpp
 
 # Object file
 OBJECTS = $(SOURCES:.cpp=.o)

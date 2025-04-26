@@ -1,332 +1,355 @@
-#include <portaudio.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
+#include <alsa/asoundlib.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <iostream>
+#include <cstring>
+#include <ctime>
 #include <vector>
 #include <thread>
-#include <string>
+#include <atomic>
+#include <csignal>
 #include <getopt.h>
-#include <stdexcept>
-#include <ctime>
-#include <sstream>
 
-// Audio configuration
-#define DEFAULT_SAMPLE_RATE (44100)
-#define CHANNELS (1)
-#define SAMPLE_FORMAT (paInt16)
-#define FRAMES_PER_BUFFER (1024)
+std::atomic<bool> running(true);
+std::atomic<bool> cleaned_up(false); // Prevent double cleanup
+snd_pcm_t* global_capture_handle = nullptr;
+int global_server_fd = -1;
 
-// Get current timestamp as string
-std::string get_timestamp() {
-    std::time_t now = std::time(nullptr);
-    std::string ts = std::ctime(&now);
-    ts.pop_back(); // Remove trailing newline
-    return ts;
+void log_message(const std::string& message) {
+    time_t now = time(nullptr);
+    char time_str[26];
+    ctime_r(&now, time_str);
+    time_str[strlen(time_str) - 1] = '\0'; // Remove newline
+    std::cout << "[" << time_str << "] " << message << std::endl;
 }
 
-void handle_client(int client_socket, PaStream* stream) {
-    try {
-        std::vector<int16_t> buffer(FRAMES_PER_BUFFER);
-        while (true) {
-            // Read audio data
-            PaError err = Pa_ReadStream(stream, buffer.data(), FRAMES_PER_BUFFER);
-            if (err != paNoError) {
-                std::cerr << "[" << get_timestamp() << "] Failed to read audio: "
-                << Pa_GetErrorText(err) << std::endl;
-                break;
-            }
+void handle_client(int client_socket, snd_pcm_t* capture_handle, unsigned int buffer_size, const std::string& client_ip) {
+    log_message("Client connected from " + client_ip);
 
-            // Send audio data
-            ssize_t bytes_sent = send(client_socket, buffer.data(),
-                                      FRAMES_PER_BUFFER * sizeof(int16_t), MSG_NOSIGNAL);
-            if (bytes_sent < 0) {
-                std::cerr << "[" << get_timestamp() << "] Client disconnected or send failed" << std::endl;
+    std::vector<int16_t> buffer(buffer_size / 2); // buffer_size is in bytes, samples are 2 bytes
+    int retries = 0;
+    const int max_retries = 5;
+
+    // Set client socket to non-blocking
+    fcntl(client_socket, F_SETFL, fcntl(client_socket, F_GETFL) | O_NONBLOCK);
+
+    while (running) {
+        // Check running before blocking call
+        if (!running) break;
+
+        int err = snd_pcm_readi(capture_handle, buffer.data(), buffer_size / 2);
+        if (err == -EPIPE || err == -EOVERFLOW) {
+            log_message("Audio buffer overflow detected, attempting recovery");
+            snd_pcm_recover(capture_handle, err, true);
+            retries++;
+            if (retries >= max_retries) {
+                log_message("Max retries reached, terminating client thread");
                 break;
             }
+            continue;
+        } else if (err < 0) {
+            log_message("Failed to read audio: " + std::string(snd_strerror(err)));
+            retries++;
+            if (retries >= max_retries) {
+                log_message("Max retries reached, terminating client thread");
+                break;
+            }
+            continue;
+        } else if (err != static_cast<int>(buffer_size / 2)) {
+            log_message("Short read: " + std::to_string(err) + " frames");
+            continue;
         }
-    } catch (const std::exception& e) {
-        std::cerr << "[" << get_timestamp() << "] Exception in client thread: " << e.what() << std::endl;
-    } catch (...) {
-        std::cerr << "[" << get_timestamp() << "] Unknown exception in client thread" << std::endl;
+
+        retries = 0; // Reset retries on successful read
+
+        // Non-blocking send
+        ssize_t sent = send(client_socket, buffer.data(), buffer_size, 0);
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue; // Retry if non-blocking send would block
+            }
+            log_message("Failed to send data to client: " + std::string(strerror(errno)));
+            break;
+        } else if (sent != static_cast<ssize_t>(buffer_size)) {
+            log_message("Incomplete send: " + std::to_string(sent) + " bytes");
+        }
     }
 
-    // Close the client socket
     close(client_socket);
-    std::cout << "[" << get_timestamp() << "] Client thread terminated" << std::endl;
+    log_message("Client thread terminated and disconnected from " + client_ip);
 }
 
-void print_usage(const char* prog_name) {
-    std::cerr << "Usage: " << prog_name
-    << " [--device <device_id>] [--host <host>] [--port <port>] [--sample-rate <rate>] [--list-device]\n"
-    << "Defaults: --device 0 --host 0.0.0.0 --port 40918 --sample-rate 44100\n"
-    << "  --list-device: List available audio input devices and exit\n";
-}
+void list_alsa_devices() {
+    snd_ctl_t *ctl;
+    snd_ctl_card_info_t *info;
+    snd_pcm_info_t *pcminfo;
+    int card = -1;
+    int err;
 
-void list_devices() {
-    PaError err = Pa_Initialize();
-    if (err != paNoError) {
-        std::cerr << "Error: Failed to initialize PortAudio: " << Pa_GetErrorText(err) << std::endl;
-        return;
-    }
+    snd_ctl_card_info_alloca(&info);
+    snd_pcm_info_alloca(&pcminfo);
 
-    int num_devices = Pa_GetDeviceCount();
-    if (num_devices < 0) {
-        std::cerr << "Error: Failed to get device count: " << Pa_GetErrorText(num_devices) << std::endl;
-        Pa_Terminate();
-        return;
-    }
+    log_message("Listing ALSA capture devices:");
+    while (snd_card_next(&card) >= 0 && card >= 0) {
+        std::string card_name = "hw:" + std::to_string(card);
+        if ((err = snd_ctl_open(&ctl, card_name.c_str(), 0)) < 0) {
+            log_message("Cannot open card " + card_name + ": " + snd_strerror(err));
+            continue;
+        }
 
-    // Common sample rates to check
-    const double sample_rates[] = {8000, 11025, 16000, 22050, 32000, 44100, 48000, 96000};
-    const int num_rates = sizeof(sample_rates) / sizeof(sample_rates[0]);
+        if ((err = snd_ctl_card_info(ctl, info)) < 0) {
+            log_message("Cannot get info for card " + card_name + ": " + snd_strerror(err));
+            snd_ctl_close(ctl);
+            continue;
+        }
 
-    std::cout << "Available audio input devices:\n";
-    std::cout << "ID\tName\tMax Input Channels\tSupported Sample Rates (Hz)\n";
-    std::cout << "------------------------------------------------------------\n";
-    for (int i = 0; i < num_devices; ++i) {
-        const PaDeviceInfo* device_info = Pa_GetDeviceInfo(i);
-        if (device_info && device_info->maxInputChannels > 0) {
-            // Check supported sample rates
-            std::vector<double> supported_rates;
-            PaStreamParameters input_params = {i, CHANNELS, SAMPLE_FORMAT, 0.0, nullptr};
-            for (int j = 0; j < num_rates; ++j) {
-                err = Pa_IsFormatSupported(&input_params, nullptr, sample_rates[j]);
-                if (err == paNoError) {
-                    supported_rates.push_back(sample_rates[j]);
+        std::cout << "Card " << card << ": " << snd_ctl_card_info_get_name(info) << " [" << card_name << "]" << std::endl;
+
+        int device = -1;
+        while (snd_ctl_pcm_next_device(ctl, &device) >= 0 && device >= 0) {
+            snd_pcm_info_set_device(pcminfo, device);
+            snd_pcm_info_set_stream(pcminfo, SND_PCM_STREAM_CAPTURE);
+            if ((err = snd_ctl_pcm_info(ctl, pcminfo)) < 0) {
+                continue;
+            }
+            std::cout << "  Device hw:" << card << "," << device << ": "
+            << snd_pcm_info_get_name(pcminfo) << std::endl;
+
+            // Query supported sample rates
+            snd_pcm_t *pcm;
+            snd_pcm_hw_params_t *hwparams;
+            snd_pcm_hw_params_alloca(&hwparams);
+            if (snd_pcm_open(&pcm, ("hw:" + std::to_string(card) + "," + std::to_string(device)).c_str(),
+                SND_PCM_STREAM_CAPTURE, 0) >= 0) {
+                snd_pcm_hw_params_any(pcm, hwparams);
+            unsigned int rmin, rmax;
+            snd_pcm_hw_params_get_rate_min(hwparams, &rmin, nullptr);
+            snd_pcm_hw_params_get_rate_max(hwparams, &rmax, nullptr);
+            std::cout << "    Supported sample rates: " << rmin << " - " << rmax << " Hz" << std::endl;
+            snd_pcm_close(pcm);
                 }
-            }
+        }
+        snd_ctl_close(ctl);
+    }
+}
 
-            // Format supported sample rates
-            std::ostringstream rates_str;
-            for (size_t j = 0; j < supported_rates.size(); ++j) {
-                rates_str << supported_rates[j];
-                if (j < supported_rates.size() - 1) rates_str << ", ";
-            }
-
-            std::cout << i << "\t" << device_info->name << "\t"
-            << device_info->maxInputChannels << "\t\t"
-            << (supported_rates.empty() ? "None" : rates_str.str()) << "\n";
+void cleanup_resources() {
+    if (!cleaned_up) {
+        cleaned_up = true;
+        log_message("Cleaning up resources");
+        if (global_server_fd >= 0) {
+            log_message("Closing server socket");
+            close(global_server_fd);
+            global_server_fd = -1;
+        }
+        if (global_capture_handle) {
+            log_message("Stopping and closing ALSA capture");
+            snd_pcm_drop(global_capture_handle);
+            snd_pcm_close(global_capture_handle);
+            global_capture_handle = nullptr;
         }
     }
-
-    Pa_Terminate();
 }
 
 int main(int argc, char* argv[]) {
-    // Default values
-    int device_id = 0;
-    std::string host = "0.0.0.0";
     int port = 40918;
-    double sample_rate = DEFAULT_SAMPLE_RATE;
-    bool list_device = false;
+    unsigned int sample_rate = 44100;
+    unsigned int buffer_size = 1024 * 2; // Bytes (1024 samples * 2 bytes)
+    unsigned int period_size = 256; // ALSA period size (frames)
+    unsigned int n_periods = 4; // Number of periods in buffer
+    std::string device = "hw:0,0";
+    bool list_devices = false;
 
-    // Define long options
+    // Parse command-line arguments
     static struct option long_options[] = {
-        {"device", required_argument, 0, 'd'},
-        {"host", required_argument, 0, 'h'},
         {"port", required_argument, 0, 'p'},
         {"sample-rate", required_argument, 0, 's'},
+        {"device", required_argument, 0, 'd'},
         {"list-device", no_argument, 0, 'l'},
         {0, 0, 0, 0}
     };
 
-    // Parse command-line arguments
     int opt;
-    while ((opt = getopt_long(argc, argv, "", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:s:d:l", long_options, nullptr)) != -1) {
         switch (opt) {
-            case 'd':
-                try {
-                    device_id = std::stoi(optarg);
-                } catch (const std::exception& e) {
-                    std::cerr << "Error: Invalid device ID" << std::endl;
-                    print_usage(argv[0]);
-                    return -1;
-                }
-                break;
-            case 'h':
-                host = optarg;
-                break;
             case 'p':
-                try {
-                    port = std::stoi(optarg);
-                } catch (const std::exception& e) {
-                    std::cerr << "Error: Invalid port number" << std::endl;
-                    print_usage(argv[0]);
-                    return -1;
-                }
+                port = std::stoi(optarg);
                 break;
             case 's':
-                try {
-                    sample_rate = std::stod(optarg);
-                    if (sample_rate <= 0) {
-                        throw std::invalid_argument("Sample rate must be positive");
-                    }
-                } catch (const std::exception& e) {
-                    std::cerr << "Error: Invalid sample rate" << std::endl;
-                    print_usage(argv[0]);
-                    return -1;
-                }
+                sample_rate = std::stoi(optarg);
+                break;
+            case 'd':
+                device = optarg;
                 break;
             case 'l':
-                list_device = true;
+                list_devices = true;
                 break;
             default:
-                print_usage(argv[0]);
-                return -1;
+                std::cerr << "Usage: " << argv[0]
+                << " [--port <port>] [--sample-rate <rate>] [--device <device>] [--list-device]" << std::endl;
+                return 1;
         }
     }
 
-    // List devices and exit if requested
-    if (list_device) {
-        list_devices();
+    if (list_devices) {
+        list_alsa_devices();
         return 0;
     }
 
-    // Initialize PortAudio
-    PaError err = Pa_Initialize();
-    if (err != paNoError) {
-        std::cerr << "[" << get_timestamp() << "] Error: Failed to initialize PortAudio: "
-        << Pa_GetErrorText(err) << std::endl;
-        return -1;
+    // Setup ALSA
+    snd_pcm_t* capture_handle;
+    snd_pcm_hw_params_t* hw_params;
+    int err;
+
+    if ((err = snd_pcm_open(&capture_handle, device.c_str(), SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+        log_message("Cannot open audio device " + device + ": " + snd_strerror(err));
+        return 1;
+    }
+    global_capture_handle = capture_handle;
+
+    snd_pcm_hw_params_alloca(&hw_params);
+    snd_pcm_hw_params_any(capture_handle, hw_params);
+
+    if ((err = snd_pcm_hw_params_set_access(capture_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) {
+        log_message("Cannot set access type: " + std::string(snd_strerror(err)));
+        cleanup_resources();
+        return 1;
     }
 
-    // Validate sample rate
-    PaStreamParameters input_params;
-    input_params.device = device_id;
-    input_params.channelCount = CHANNELS;
-    input_params.sampleFormat = SAMPLE_FORMAT;
-    input_params.suggestedLatency = 0.0;
-    input_params.hostApiSpecificStreamInfo = nullptr;
-
-    err = Pa_IsFormatSupported(&input_params, nullptr, sample_rate);
-    if (err != paNoError) {
-        std::cerr << "[" << get_timestamp() << "] Error: Sample rate " << sample_rate
-        << " not supported by device " << device_id << ": "
-        << Pa_GetErrorText(err) << std::endl;
-        Pa_Terminate();
-        return -1;
+    if ((err = snd_pcm_hw_params_set_format(capture_handle, hw_params, SND_PCM_FORMAT_S16_LE)) < 0) {
+        log_message("Cannot set sample format: " + std::string(snd_strerror(err)));
+        cleanup_resources();
+        return 1;
     }
 
-    // Open audio stream
-    PaStream* stream;
-    err = Pa_OpenStream(
-        &stream,
-        &input_params,
-        nullptr, // No output
-        sample_rate,
-        FRAMES_PER_BUFFER,
-        paClipOff,
-        nullptr, // No callback
-        nullptr
-    );
-    if (err != paNoError) {
-        std::cerr << "[" << get_timestamp() << "] Error: Could not open audio device "
-        << device_id << ": " << Pa_GetErrorText(err) << std::endl;
-        Pa_Terminate();
-        return -1;
+    unsigned int actual_rate = sample_rate;
+    if ((err = snd_pcm_hw_params_set_rate_near(capture_handle, hw_params, &actual_rate, 0)) < 0) {
+        log_message("Cannot set sample rate: " + std::string(snd_strerror(err)));
+        cleanup_resources();
+        return 1;
+    }
+    if (actual_rate != sample_rate) {
+        log_message("Warning: Actual sample rate is " + std::to_string(actual_rate) + " Hz");
+        sample_rate = actual_rate;
     }
 
-    // Start audio stream
-    err = Pa_StartStream(stream);
-    if (err != paNoError) {
-        std::cerr << "[" << get_timestamp() << "] Error: Could not start audio stream: "
-        << Pa_GetErrorText(err) << std::endl;
-        Pa_CloseStream(stream);
-        Pa_Terminate();
-        return -1;
+    if ((err = snd_pcm_hw_params_set_channels(capture_handle, hw_params, 1)) < 0) {
+        log_message("Cannot set channel count: " + std::string(snd_strerror(err)));
+        cleanup_resources();
+        return 1;
     }
 
-    // Create socket
+    if ((err = snd_pcm_hw_params_set_period_size(capture_handle, hw_params, period_size, 0)) < 0) {
+        log_message("Cannot set period size: " + std::string(snd_strerror(err)));
+        cleanup_resources();
+        return 1;
+    }
+
+    if ((err = snd_pcm_hw_params_set_periods(capture_handle, hw_params, n_periods, 0)) < 0) {
+        log_message("Cannot set periods: " + std::string(snd_strerror(err)));
+        cleanup_resources();
+        return 1;
+    }
+
+    if ((err = snd_pcm_hw_params(capture_handle, hw_params)) < 0) {
+        log_message("Cannot set parameters: " + std::string(snd_strerror(err)));
+        cleanup_resources();
+        return 1;
+    }
+
+    snd_pcm_uframes_t actual_buffer_size;
+    snd_pcm_hw_params_get_buffer_size(hw_params, &actual_buffer_size);
+    log_message("ALSA buffer size: " + std::to_string(actual_buffer_size) + " frames");
+    log_message("ALSA period size: " + std::to_string(period_size) + " frames");
+    log_message("ALSA sample rate: " + std::to_string(sample_rate) + " Hz");
+
+    if ((err = snd_pcm_prepare(capture_handle)) < 0) {
+        log_message("Cannot prepare audio interface: " + std::string(snd_strerror(err)));
+        cleanup_resources();
+        return 1;
+    }
+
+    // Setup socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
-        std::cerr << "[" << get_timestamp() << "] Error: Could not create socket" << std::endl;
-        Pa_CloseStream(stream);
-        Pa_Terminate();
-        return -1;
+        log_message("Socket creation failed: " + std::string(strerror(errno)));
+        cleanup_resources();
+        return 1;
+    }
+    global_server_fd = server_fd;
+
+    // Set server socket to non-blocking
+    fcntl(server_fd, F_SETFL, fcntl(server_fd, F_GETFL) | O_NONBLOCK);
+
+    opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        log_message("Setsockopt failed: " + std::string(strerror(errno)));
+        cleanup_resources();
+        return 1;
     }
 
-    // Set socket options to reuse address
-    int sock_opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &sock_opt, sizeof(sock_opt));
+    struct sockaddr_in address;
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
 
-    // Configure server address
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    if (inet_pton(AF_INET, host.c_str(), &server_addr.sin_addr) <= 0) {
-        std::cerr << "[" << get_timestamp() << "] Error: Invalid host address" << std::endl;
-        close(server_fd);
-        Pa_CloseStream(stream);
-        Pa_Terminate();
-        return -1;
-    }
-    server_addr.sin_port = htons(port);
-
-    // Bind socket
-    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        std::cerr << "[" << get_timestamp() << "] Error: Bind failed" << std::endl;
-        close(server_fd);
-        Pa_CloseStream(stream);
-        Pa_Terminate();
-        return -1;
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        log_message("Bind failed: " + std::string(strerror(errno)));
+        cleanup_resources();
+        return 1;
     }
 
-    // Listen for connections
-    if (listen(server_fd, 1) < 0) {
-        std::cerr << "[" << get_timestamp() << "] Error: Listen failed" << std::endl;
-        close(server_fd);
-        Pa_CloseStream(stream);
-        Pa_Terminate();
-        return -1;
+    if (listen(server_fd, 3) < 0) {
+        log_message("Listen failed: " + std::string(strerror(errno)));
+        cleanup_resources();
+        return 1;
     }
 
-    std::cout << "[" << get_timestamp() << "] Server listening on " << host << ":" << port << std::endl;
+    log_message("Server listening on port " + std::to_string(port));
 
-    int current_client = -1;
-    while (true) {
-        try {
-            struct sockaddr_in client_addr;
-            socklen_t client_len = sizeof(client_addr);
+    // Signal handler for clean shutdown
+    signal(SIGINT, [](int) {
+        running = false;
+        log_message("Received SIGINT, shutting down...");
+        cleanup_resources();
+    });
 
-            // Accept new connection
-            int new_client = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-            if (new_client < 0) {
-                std::cerr << "[" << get_timestamp() << "] Error: Accept failed" << std::endl;
+    while (running) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        int client_socket = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len);
+        if (client_socket < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (!running) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
             }
-
-            // Get client IP address
-            char client_ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
-
-            // Log new connection
-            std::cout << "[" << get_timestamp() << "] New connection from " << client_ip << std::endl;
-
-            // Close existing connection if any
-            if (current_client != -1) {
-                close(current_client);
-                std::cout << "[" << get_timestamp() << "] Closed previous connection" << std::endl;
+            if (running) {
+                log_message("Accept failed: " + std::string(strerror(errno)));
             }
-
-            // Update current client
-            current_client = new_client;
-
-            // Handle client in a new thread
-            std::thread client_thread(handle_client, current_client, stream);
-            client_thread.detach();
-        } catch (const std::exception& e) {
-            std::cerr << "[" << get_timestamp() << "] Exception in main loop: " << e.what() << std::endl;
-            continue;
-        } catch (...) {
-            std::cerr << "[" << get_timestamp() << "] Unknown exception in main loop" << std::endl;
             continue;
         }
+
+        // Get client IP
+        std::string client_ip = inet_ntoa(client_addr.sin_addr);
+
+        // Close previous connection if any
+        static std::thread client_thread;
+        if (client_thread.joinable()) {
+            log_message("Closed previous connection from " + client_ip);
+            running = false; // Signal previous thread to exit
+            client_thread.join();
+            running = true;
+        }
+
+        // Start new client thread
+        client_thread = std::thread(handle_client, client_socket, capture_handle, buffer_size, client_ip);
+        client_thread.detach();
     }
 
-    // Cleanup
-    close(server_fd);
-    Pa_CloseStream(stream);
-    Pa_Terminate();
+    cleanup_resources();
+    log_message("Server shutdown complete");
     return 0;
 }
