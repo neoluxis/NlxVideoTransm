@@ -1,0 +1,37 @@
+# Makefile for audio_stream.cpp
+
+# Compiler
+CXX = g++
+
+# Compiler flags
+CXXFLAGS = -std=c++11
+
+# Linker flags
+LDFLAGS = -lportaudio
+
+# Target executable
+TARGET = server
+
+# Source file
+SOURCES = server.cpp
+
+# Object file
+OBJECTS = $(SOURCES:.cpp=.o)
+
+# Default target
+all: $(TARGET)
+
+# Link object files to create executable
+$(TARGET): $(OBJECTS)
+	$(CXX) $(OBJECTS) -o $(TARGET) $(LDFLAGS)
+
+# Compile source files to object files
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# Clean up build artifacts
+clean:
+	rm -f $(OBJECTS) $(TARGET)
+
+# Phony targets
+.PHONY: all clean
