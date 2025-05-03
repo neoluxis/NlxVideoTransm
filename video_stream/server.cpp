@@ -10,6 +10,8 @@
 #include <getopt.h>
 #include <stdexcept>
 #include <ctime>
+#include <fcntl.h>
+#include <termios.h>
 
 // Get current timestamp as string
 std::string get_timestamp() {
@@ -19,13 +21,49 @@ std::string get_timestamp() {
     return ts;
 }
 
-void handle_client(int client_socket, cv::VideoCapture& cap) {
+void handle_serial(int serial_fd, bool& snapshot_signal) {
+    try {
+        char buffer[1];
+        while (true) {
+            int bytes_read = read(serial_fd, buffer, 1);
+            if (bytes_read > 0 && buffer[0] == 'S') { // 'S' for snapshot signal
+                snapshot_signal = true;
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[" << get_timestamp() << "] Exception in serial thread: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[" << get_timestamp() << "] Unknown exception in serial thread" << std::endl;
+    }
+}
+
+void handle_client(int client_socket, cv::VideoCapture& cap, bool& snapshot_signal) {
     try {
         while (true) {
             cv::Mat frame;
-            if (!cap.read(frame) || frame.empty()) {
-                std::cerr << "[" << get_timestamp() << "] Failed to capture frame" << std::endl;
-                break;
+
+            if (snapshot_signal) {
+                // Capture at maximum resolution
+                int max_width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+                int max_height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+                cap.set(cv::CAP_PROP_FRAME_WIDTH, max_width);
+                cap.set(cv::CAP_PROP_FRAME_HEIGHT, max_height);
+
+                if (!cap.read(frame) || frame.empty()) {
+                    std::cerr << "[" << get_timestamp() << "] Failed to capture snapshot frame" << std::endl;
+                    break;
+                }
+
+                snapshot_signal = false; // Reset snapshot signal
+
+                // Restore normal resolution
+                cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+                cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+            } else {
+                if (!cap.read(frame) || frame.empty()) {
+                    std::cerr << "[" << get_timestamp() << "] Failed to capture frame" << std::endl;
+                    break;
+                }
             }
 
             // Encode frame as JPEG
@@ -55,6 +93,46 @@ void handle_client(int client_socket, cv::VideoCapture& cap) {
     // Close the client socket
     close(client_socket);
     std::cout << "[" << get_timestamp() << "] Client thread terminated" << std::endl;
+}
+
+uint8_t init_serial(const std::string& serial, int baudrate) {
+    int fd = open(serial.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
+    if (fd < 0) {
+        std::cerr << "[" << get_timestamp() << "] Error: Could not open serial device " << serial << std::endl;
+        return -1;
+    }
+
+    struct termios tty;
+    if (tcgetattr(fd, &tty) != 0) {
+        std::cerr << "[" << get_timestamp() << "] Error: Could not get serial attributes" << std::endl;
+        close(fd);
+        return -1;
+    }
+
+    cfsetospeed(&tty, baudrate);
+    cfsetispeed(&tty, baudrate);
+
+    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8; // 8-bit chars
+    tty.c_iflag &= ~IGNBRK;                     // disable break processing
+    tty.c_lflag = 0;                            // no signaling chars, no echo, no canonical processing
+    tty.c_oflag = 0;                            // no remapping, no delays
+    tty.c_cc[VMIN] = 1;                         // read doesn't block
+    tty.c_cc[VTIME] = 1;                        // 0.1 seconds read timeout
+
+    tty.c_iflag &= ~(IXON | IXOFF | IXANY);     // shut off xon/xoff ctrl
+
+    tty.c_cflag |= (CLOCAL | CREAD);            // ignore modem controls, enable reading
+    tty.c_cflag &= ~(PARENB | PARODD);          // shut off parity
+    tty.c_cflag &= ~CSTOPB;
+    tty.c_cflag &= ~CRTSCTS;
+
+    if (tcsetattr(fd, TCSANOW, &tty) != 0) {
+        std::cerr << "[" << get_timestamp() << "] Error: Could not set serial attributes" << std::endl;
+        close(fd);
+        return -1;
+    }
+
+    return fd;
 }
 
 void print_usage(const char* prog_name) {
@@ -173,7 +251,27 @@ int main(int argc, char* argv[]) {
     cap.set(cv::CAP_PROP_FRAME_WIDTH, fwidth);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, fheight);
     cap.set(cv::CAP_PROP_FPS, fps);
-    
+
+    // Open serial device if specified
+    int serial_fd = -1;
+    if (!serial.empty()) {
+        serial_fd = init_serial(serial, baudrate);
+        if (serial_fd < 0) {
+            std::cerr << "[" << get_timestamp() << "] Error: Could not open serial device " << serial << std::endl;
+            return -1;
+        }
+        
+        std::cout << "[" << get_timestamp() << "] Serial device " << serial << " opened at baud rate " << baudrate << std::endl;
+    }
+
+    // Snapshot signal flag
+    bool snapshot_signal = false;
+
+    // Start serial handling thread
+    std::thread serial_thread;
+    if (serial_fd >= 0) {
+        serial_thread = std::thread(handle_serial, serial_fd, std::ref(snapshot_signal));
+    }
 
     // Create socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -242,7 +340,7 @@ int main(int argc, char* argv[]) {
             current_client = new_client;
 
             // Handle client in a new thread
-            std::thread client_thread(handle_client, current_client, std::ref(cap));
+            std::thread client_thread(handle_client, current_client, std::ref(cap), std::ref(snapshot_signal));
             client_thread.detach();
         } catch (const std::exception& e) {
             std::cerr << "[" << get_timestamp() << "] Exception in main loop: " << e.what() << std::endl;
@@ -254,6 +352,12 @@ int main(int argc, char* argv[]) {
     }
 
     // Cleanup
+    if (serial_fd >= 0) {
+        close(serial_fd);
+        if (serial_thread.joinable()) {
+            serial_thread.join();
+        }
+    }
     close(server_fd);
     cap.release();
     return 0;
