@@ -38,5 +38,10 @@ install:
 	cp ./video-stream.service /usr/lib/systemd/system/
 	systemctl daemon-reload
 
+uninstall:
+	rm -f /usr/local/bin/vstream
+	rm -f /usr/lib/systemd/system/video-stream.service
+	systemctl daemon-reload
+
 # Phony targets
 .PHONY: all clean
