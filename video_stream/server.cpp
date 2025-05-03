@@ -26,8 +26,12 @@ void handle_serial(int serial_fd, bool& snapshot_signal) {
         char buffer[1];
         while (true) {
             int bytes_read = read(serial_fd, buffer, 1);
-            if (bytes_read > 0 && buffer[0] == 'S') { // 'S' for snapshot signal
-                snapshot_signal = true;
+            if (bytes_read > 0) { // 'S' for snapshot signal
+                std::cout << "[" << get_timestamp() << "] Received: " << buffer[0] << std::endl;
+                if (buffer[0] == 'S') {
+                    snapshot_signal = true;
+                    std::cout << "[" << get_timestamp() << "] Snap signal received!!!" << std::endl;
+                }
             }
         }
     } catch (const std::exception& e) {
@@ -37,17 +41,17 @@ void handle_serial(int serial_fd, bool& snapshot_signal) {
     }
 }
 
-void handle_client(int client_socket, cv::VideoCapture& cap, bool& snapshot_signal) {
+void handle_client(int client_socket,
+                   cv::VideoCapture& cap,
+                   bool& snapshot_signal,
+                   int width, int height, int snapw, int snaph) {
     try {
         while (true) {
             cv::Mat frame;
 
             if (snapshot_signal) {
-                // Capture at maximum resolution
-                int max_width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-                int max_height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-                cap.set(cv::CAP_PROP_FRAME_WIDTH, max_width);
-                cap.set(cv::CAP_PROP_FRAME_HEIGHT, max_height);
+                cap.set(cv::CAP_PROP_FRAME_WIDTH, snapw);
+                cap.set(cv::CAP_PROP_FRAME_HEIGHT, snaph);
 
                 if (!cap.read(frame) || frame.empty()) {
                     std::cerr << "[" << get_timestamp() << "] Failed to capture snapshot frame" << std::endl;
@@ -57,8 +61,8 @@ void handle_client(int client_socket, cv::VideoCapture& cap, bool& snapshot_sign
                 snapshot_signal = false; // Reset snapshot signal
 
                 // Restore normal resolution
-                cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-                cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+                cap.set(cv::CAP_PROP_FRAME_WIDTH, width);
+                cap.set(cv::CAP_PROP_FRAME_HEIGHT, height);
             } else {
                 if (!cap.read(frame) || frame.empty()) {
                     std::cerr << "[" << get_timestamp() << "] Failed to capture frame" << std::endl;
@@ -142,6 +146,8 @@ void print_usage(const char* prog_name) {
                 << "  -d, --device <device>    Video device (default: /dev/video8)\n"
                 << "  -w, --width <width>      Frame width (default: 640)\n"
                 << "  -h, --height <height>    Frame height (default: 480)\n"
+                << "  -P, --snaph <width>      Frame width (default: 640)\n"
+                << "  -O, --snapw <height>    Frame height (default: 480)\n"
                 << "  -f, --fps <fps>          Frames per second (default: 30)\n"
                 << "  -H, --host <host>        Host address (default: 0.0.0.0)\n"
                 << "  -P, --port <port>        Port number (default: 40917)\n"
@@ -155,6 +161,8 @@ int main(int argc, char* argv[]) {
     std::string device = "/dev/video8";
     int fwidth = 640;
     int fheight = 480;
+    int snaph = fheight;
+    int snapw = fwidth;
     int fps = 30;
     std::string host = "0.0.0.0";
     int port = 40917;
@@ -167,8 +175,10 @@ int main(int argc, char* argv[]) {
         {"width", required_argument, 0, 'w'},
         {"height", required_argument, 0, 'h'},
         {"fps", required_argument, 0, 'f'},
+        {"snaph", required_argument, 0, 'P'},
+        {"snapw", required_argument, 0, 'O'},
         {"host", required_argument, 0, 'H'},
-        {"port", required_argument, 0, 'P'},
+        {"port", required_argument, 0, 'p'},
         {"serial", required_argument, 0, 's'},
         {"baudrate", required_argument, 0, 'b'},
         {"help", no_argument, 0, 'x'},
@@ -209,10 +219,28 @@ int main(int argc, char* argv[]) {
                     return -1;
                 }
                 break;
+            case 'P':
+                try {
+                    snaph = std::stoi(optarg);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error: Invalid snaph" << std::endl;
+                    print_usage(argv[0]);
+                    return -1;
+                }
+                break;
+            case 'O':
+                try {
+                    snapw = std::stoi(optarg);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error: Invalid snapw" << std::endl;
+                    print_usage(argv[0]);
+                    return -1;
+                }
+                break;
             case 'H':
                 host = optarg;
                 break;
-            case 'P':
+            case 'p':
                 try {
                     port = std::stoi(optarg);
                 } catch (const std::exception& e) {
@@ -251,6 +279,7 @@ int main(int argc, char* argv[]) {
     cap.set(cv::CAP_PROP_FRAME_WIDTH, fwidth);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, fheight);
     cap.set(cv::CAP_PROP_FPS, fps);
+    std::cout << "[" << get_timestamp() << "] Set frame size " << fwidth << "x" << fheight << std::endl;
 
     // Open serial device if specified
     int serial_fd = -1;
@@ -340,7 +369,11 @@ int main(int argc, char* argv[]) {
             current_client = new_client;
 
             // Handle client in a new thread
-            std::thread client_thread(handle_client, current_client, std::ref(cap), std::ref(snapshot_signal));
+            std::thread client_thread(handle_client,
+                                      current_client,
+                                      std::ref(cap),
+                                      std::ref(snapshot_signal),
+                                      fwidth, fheight, snapw, snaph);
             client_thread.detach();
         } catch (const std::exception& e) {
             std::cerr << "[" << get_timestamp() << "] Exception in main loop: " << e.what() << std::endl;
