@@ -59,22 +59,42 @@ void handle_client(int client_socket, cv::VideoCapture& cap) {
 
 void print_usage(const char* prog_name) {
     std::cerr << "Usage: " << prog_name 
-              << " [--device <device>] [--host <host>] [--port <port>]\n"
-              << "Defaults: --device /dev/video8 --host 0.0.0.0 --port 40917\n";
+                << " [options]\n"
+                << "Options:\n"
+                << "  -d, --device <device>    Video device (default: /dev/video8)\n"
+                << "  -w, --width <width>      Frame width (default: 640)\n"
+                << "  -h, --height <height>    Frame height (default: 480)\n"
+                << "  -f, --fps <fps>          Frames per second (default: 30)\n"
+                << "  -H, --host <host>        Host address (default: 0.0.0.0)\n"
+                << "  -P, --port <port>        Port number (default: 40917)\n"
+                << "  -s, --serial <serial>    Serial device (default: empty)\n"
+                << "  -b, --baudrate <baudrate> Baud rate (default: 115200)\n"
+                << "  -x, --help               Show this help message\n";
 }
 
 int main(int argc, char* argv[]) {
     // Default values
     std::string device = "/dev/video8";
+    int fwidth = 640;
+    int fheight = 480;
+    int fps = 30;
     std::string host = "0.0.0.0";
     int port = 40917;
+    std::string serial = "";
+    int baudrate = 115200;
 
     // Define long options
     static struct option long_options[] = {
         {"device", required_argument, 0, 'd'},
-        {"host", required_argument, 0, 'h'},
-        {"port", required_argument, 0, 'p'},
-        {0, 0, 0, 0}
+        {"width", required_argument, 0, 'w'},
+        {"height", required_argument, 0, 'h'},
+        {"fps", required_argument, 0, 'f'},
+        {"host", required_argument, 0, 'H'},
+        {"port", required_argument, 0, 'P'},
+        {"serial", required_argument, 0, 's'},
+        {"baudrate", required_argument, 0, 'b'},
+        {"help", no_argument, 0, 'x'},
+        {0, 0, 0, 0} // End of options
     };
 
     // Parse command-line arguments
@@ -84,10 +104,37 @@ int main(int argc, char* argv[]) {
             case 'd':
                 device = optarg;
                 break;
+            case 'w':
+                try {
+                    fwidth = std::stoi(optarg);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error: Invalid width" << std::endl;
+                    print_usage(argv[0]);
+                    return -1;
+                }
+                break;
             case 'h':
+                try {
+                    fheight = std::stoi(optarg);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error: Invalid height" << std::endl;
+                    print_usage(argv[0]);
+                    return -1;
+                }
+                break;
+            case 'f':
+                try {
+                    fps = std::stoi(optarg);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error: Invalid FPS" << std::endl;
+                    print_usage(argv[0]);
+                    return -1;
+                }
+                break;
+            case 'H':
                 host = optarg;
                 break;
-            case 'p':
+            case 'P':
                 try {
                     port = std::stoi(optarg);
                 } catch (const std::exception& e) {
@@ -96,6 +143,21 @@ int main(int argc, char* argv[]) {
                     return -1;
                 }
                 break;
+            case 's':
+                serial = optarg;
+                break;
+            case 'b':
+                try {
+                    baudrate = std::stoi(optarg);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error: Invalid baud rate" << std::endl;
+                    print_usage(argv[0]);
+                    return -1;
+                }
+                break;
+            case 'x':
+                print_usage(argv[0]);
+                return 0;
             default:
                 print_usage(argv[0]);
                 return -1;
@@ -108,6 +170,10 @@ int main(int argc, char* argv[]) {
         std::cerr << "[" << get_timestamp() << "] Error: Could not open video device " << device << std::endl;
         return -1;
     }
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, fwidth);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, fheight);
+    cap.set(cv::CAP_PROP_FPS, fps);
+    
 
     // Create socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
