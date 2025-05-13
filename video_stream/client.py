@@ -3,12 +3,13 @@ import socket
 import struct
 import cv2
 import numpy as np
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QLineEdit, QPushButton)
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from datetime import datetime
 import io
+import time
 
 class StreamThread(QThread):
     frame_received = pyqtSignal(np.ndarray)
@@ -24,11 +25,13 @@ class StreamThread(QThread):
         try:
             # Connect to the server
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)  # 1MB buffer
             sock.connect((self.host, self.port))
 
             while self.running:
                 # Read frame size (4 bytes, network byte order)
                 size_data = b""
+                start_time = time.time()
                 while len(size_data) < 4 and self.running:
                     chunk = sock.recv(4 - len(size_data))
                     if not chunk:
@@ -49,14 +52,21 @@ class StreamThread(QThread):
                 if not self.running:
                     break
 
+                receive_time = time.time() - start_time
+                print(f"Receive time: {receive_time*1000:.1f} ms")
+
                 # Decode JPEG to image
+                start_time = time.time()
                 frame_array = np.frombuffer(frame_data, dtype=np.uint8)
-                frame = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
+                frame = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)  # Fixed syntax
                 if frame is None:
                     continue
 
                 # Convert BGR to RGB for Qt
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                decode_time = time.time() - start_time
+                print(f"Decode time: {decode_time*1000:.1f} ms")
+
                 self.frame_received.emit(frame_rgb)
 
             sock.close()
@@ -94,13 +104,27 @@ class VideoClient(QMainWindow):
         self.video_label.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(self.video_label)
 
-        # Save button
+        # Buttons layout
+        buttons_layout = QHBoxLayout()
         self.save_button = QPushButton("Save Snapshot")
-        self.save_button.setEnabled(False)  # Disabled until connected
-        main_layout.addWidget(self.save_button)
+        self.save_button.setEnabled(False)
+        self.record_button = QPushButton("Start Recording")
+        self.record_button.setEnabled(False)
+        buttons_layout.addWidget(self.save_button)
+        buttons_layout.addWidget(self.record_button)
+        main_layout.addLayout(buttons_layout)
 
         # Current frame
         self.current_frame = None
+
+        # FPS calculation
+        self.frame_count = 0
+        self.last_time = time.time()
+        self.fps = 0.0
+
+        # Recording
+        self.is_recording = False
+        self.video_writer = None
 
         # Stream thread
         self.stream_thread = None
@@ -108,6 +132,7 @@ class VideoClient(QMainWindow):
         # Connect signals
         self.connect_button.clicked.connect(self.start_stream)
         self.save_button.clicked.connect(self.save_snapshot)
+        self.record_button.clicked.connect(self.toggle_recording)
 
     def start_stream(self):
         if self.stream_thread and self.stream_thread.isRunning():
@@ -130,6 +155,11 @@ class VideoClient(QMainWindow):
         self.connect_button.clicked.disconnect()
         self.connect_button.clicked.connect(self.stop_stream)
         self.save_button.setEnabled(True)
+        self.record_button.setEnabled(True)
+
+        # Reset FPS
+        self.frame_count = 0
+        self.last_time = time.time()
 
     def stop_stream(self):
         if self.stream_thread:
@@ -137,21 +167,52 @@ class VideoClient(QMainWindow):
             self.stream_thread.wait()
             self.stream_thread = None
 
+        # Stop recording if active
+        if self.is_recording:
+            self.stop_recording()
+
         self.video_label.clear()
         self.video_label.setText("Disconnected")
         self.connect_button.setText("Connect")
         self.connect_button.clicked.disconnect()
         self.connect_button.clicked.connect(self.start_stream)
         self.save_button.setEnabled(False)
+        self.record_button.setEnabled(False)
 
     def update_frame(self, frame):
+        start_time = time.time()
         self.current_frame = frame
         h, w, c = frame.shape
-        image = QImage(frame.data, w, h, w * c, QImage.Format_RGB888)
+
+        # Draw FPS on frame
+        frame_with_fps = frame.copy()
+        fps_text = f"FPS: {self.fps:.1f}"
+        cv2.putText(frame_with_fps, fps_text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+
+        # Display frame
+        image = QImage(frame_with_fps.data, w, h, w * c, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(image)
-        self.video_label.setPixmap(pixmap.scaled(self.video_label.size(), 
-                                                Qt.KeepAspectRatio, 
-                                                Qt.SmoothTransformation))
+        self.video_label.setPixmap(pixmap.scaled(self.video_label.size(),
+                                                Qt.KeepAspectRatio,
+                                                Qt.FastTransformation))  # Faster scaling
+
+        # Update FPS
+        self.frame_count += 1
+        current_time = time.time()
+        elapsed = current_time - self.last_time
+        if elapsed >= 1.0:
+            self.fps = self.frame_count / elapsed
+            self.frame_count = 0
+            self.last_time = current_time
+
+        # Record frame if recording
+        if self.is_recording and self.video_writer is not None:
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            self.video_writer.write(frame_bgr)
+
+        display_time = time.time() - start_time
+        print(f"Display time: {display_time*1000:.1f} ms")
 
     def save_snapshot(self):
         if self.current_frame is None:
@@ -166,6 +227,39 @@ class VideoClient(QMainWindow):
         cv2.imwrite(filename, frame_bgr)
         print(f"Saved snapshot to {filename}")
 
+    def toggle_recording(self):
+        if not self.is_recording:
+            self.start_recording()
+        else:
+            self.stop_recording()
+
+    def start_recording(self):
+        if self.current_frame is None:
+            return
+
+        # Generate timestamped filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"recording_{timestamp}.avi"
+
+        # Get frame dimensions
+        h, w, _ = self.current_frame.shape
+
+        # Initialize VideoWriter
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        self.video_writer = cv2.VideoWriter(filename, fourcc, 20.0, (w, h))
+
+        self.is_recording = True
+        self.record_button.setText("Stop Recording")
+        print(f"Started recording to {filename}")
+
+    def stop_recording(self):
+        if self.video_writer is not None:
+            self.video_writer.release()
+            self.video_writer = None
+        self.is_recording = False
+        self.record_button.setText("Start Recording")
+        print("Stopped recording")
+
     def handle_error(self, error_msg):
         self.stop_stream()
         self.video_label.setText(f"Error: {error_msg}")
@@ -174,6 +268,8 @@ class VideoClient(QMainWindow):
         if self.stream_thread:
             self.stream_thread.stop()
             self.stream_thread.wait()
+        if self.is_recording:
+            self.stop_recording()
         event.accept()
 
 if __name__ == "__main__":
