@@ -7,7 +7,7 @@ CXX = g++
 CXXFLAGS = -std=c++11 `pkg-config --cflags opencv4`
 
 # Linker flags
-LDFLAGS = `pkg-config --libs opencv4`
+LDFLAGS = `pkg-config --libs opencv4` -pthread
 
 # Target executable
 TARGET = server
